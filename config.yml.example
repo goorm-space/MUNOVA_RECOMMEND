@@ -1,0 +1,32 @@
+# ================================
+# 🧠 MUNOVA Recommend Server Config
+# ================================
+app:
+  name: recommend-server
+  env: docker
+  log_level: INFO
+  consumer_group: recommend-consumer-group
+  stream_prefix: user_action_stream_
+
+redis:
+  cluster:
+    password: ""  # Redis Cluster 비밀번호 입력
+    nodes:
+      - host: redis-node-1
+        port: 7006
+      - host: redis-node-2
+        port: 7007
+      - host: redis-node-3
+        port: 7008
+      - host: redis-node-4
+        port: 7009
+      - host: redis-node-5
+        port: 7010
+      - host: redis-node-6
+        port: 7011
+
+influxdb:
+  host: http://influxdb:8086
+  database: k6
+  enabled: true
+

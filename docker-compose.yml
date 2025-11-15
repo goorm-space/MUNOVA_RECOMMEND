@@ -1,0 +1,18 @@
+services:
+  recommend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: recommend
+    restart: always
+    networks:
+      - munova-net
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - .:/app
+
+
+networks:
+  munova-net:
+    external: true
