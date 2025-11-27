@@ -1,0 +1,521 @@
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+import math
+
+# 가중치 상수
+CLICK_WEIGHT = 0.1
+LIKE_WEIGHT = 0.15
+CART_WEIGHT = 0.35
+PURCHASE_WEIGHT = 0.5
+DECAY_RATE = 0.05  # 하루당 5% 감쇠
+MIN_DECAY = 0.5     # 최소 유지 비율
+CACHE_TTL_MINUTES = 10
+
+
+class UserActionSummary:
+    """사용자 행동 요약 데이터"""
+    def __init__(
+        self,
+        member_id: int,
+        product_id: int,
+        clicked: int = 0,
+        liked: Optional[bool] = None,
+        in_cart: Optional[bool] = None,
+        purchased: Optional[bool] = None,
+        clicked_at: Optional[datetime] = None,
+        liked_at: Optional[datetime] = None,
+        in_cart_at: Optional[datetime] = None,
+        purchased_at: Optional[datetime] = None,
+        last_updated: Optional[datetime] = None,
+        # 추가 메타데이터 (정밀한 추천을 위해)
+        category_id: Optional[int] = None,
+        brand_id: Optional[int] = None,
+        price: Optional[int] = None,
+        session_id: Optional[str] = None
+    ):
+        self.member_id = member_id
+        self.product_id = product_id
+        self.clicked = clicked
+        self.liked = liked
+        self.in_cart = in_cart
+        self.purchased = purchased
+        self.clicked_at = clicked_at
+        self.liked_at = liked_at
+        self.in_cart_at = in_cart_at
+        self.purchased_at = purchased_at
+        self.last_updated = last_updated or datetime.now()
+        # 추가 메타데이터
+        self.category_id = category_id
+        self.brand_id = brand_id
+        self.price = price
+        self.session_id = session_id
+
+
+class Recommender:
+    def __init__(self, redis_client=None, db_session=None):
+        """
+        Args:
+            redis_client: Redis 클라이언트 (캐시용)
+            db_session: 데이터베이스 세션 (SQLAlchemy Session) - None일 수 있음 (매 요청마다 설정 가능)
+        """
+        self.redis_client = redis_client
+        self.db_session = db_session  # 매 요청마다 설정 가능하도록 함
+        # 처리 대상 이벤트(추천 반영)
+        self.supported_events = {
+            "product_detail",
+            "product_like",
+            "cancel_product_like",
+            "create_cart",
+            "delete_cart",
+            "end_payment",
+            "refund",
+        }
+        # 조회성/운영성 이벤트(기본 무시)
+        self.readonly_event_prefixes = ("find_",)
+        self.readonly_event_suffixes = ("_detail",)
+    
+    def get_recommendation_score(
+        self,
+        member_id: int,
+        product_id: int,
+        summary: Optional[UserActionSummary] = None
+    ) -> float:
+        """
+        추천 점수 계산 (0~100)
+        
+        Args:
+            member_id: 사용자 ID
+            product_id: 상품 ID
+            summary: 사용자 행동 요약 (없으면 기본값 사용)
+        
+        Returns:
+            추천 점수 (0~100)
+        """
+        if summary is None:
+            summary = self._get_user_action_summary(member_id, product_id)
+        
+        now = datetime.now()
+        
+        total_score = (
+            self._score_with_decay(summary.clicked_at, CLICK_WEIGHT, now)
+            + self._score_with_decay(summary.liked_at, LIKE_WEIGHT, now, summary.liked)
+            + self._score_with_decay(summary.in_cart_at, CART_WEIGHT, now, summary.in_cart)
+            + self._score_with_decay(summary.purchased_at, PURCHASE_WEIGHT, now, summary.purchased)
+        )
+        
+        max_score = CLICK_WEIGHT + LIKE_WEIGHT + CART_WEIGHT + PURCHASE_WEIGHT
+        return (total_score / max_score) * 100
+    
+    def _score_with_decay(
+        self,
+        action_time: Optional[datetime],
+        weight: float,
+        now: datetime,
+        condition: Optional[bool] = None
+    ) -> float:
+        """
+        시간 감쇠를 적용한 점수 계산
+        
+        Args:
+            action_time: 행동 발생 시간
+            weight: 가중치
+            now: 현재 시간
+            condition: 조건 (liked, in_cart, purchased 등)
+        
+        Returns:
+            감쇠가 적용된 점수
+        """
+        if condition is False:
+            return 0
+        if action_time is None:
+            return 0
+        
+        days = (now - action_time).days
+        decay_factor = max(MIN_DECAY, 1 - DECAY_RATE * days)
+        return weight * decay_factor
+    
+    def _get_user_action_summary(
+        self,
+        member_id: int,
+        product_id: int
+    ) -> UserActionSummary:
+        """
+        사용자 행동 요약 조회 (Redis 캐시 우선)
+        
+        Args:
+            member_id: 사용자 ID
+            product_id: 상품 ID
+        
+        Returns:
+            UserActionSummary 객체
+        """
+        cache_key = f"user:action:{member_id}:{product_id}"
+        
+        # Redis 캐시에서 조회
+        if self.redis_client:
+            try:
+                cached = self.redis_client.get(cache_key)
+                if cached:
+                    # TODO: JSON 역직렬화 구현
+                    pass
+            except Exception as e:
+                print(f"⚠️ Redis 캐시 조회 실패: {e}")
+        
+        # DB에서 조회
+        if self.db_session:
+            try:
+                from services.database import UserActionSummary as DBUserActionSummary
+                db_summary = self.db_session.query(DBUserActionSummary).filter(
+                    DBUserActionSummary.member_id == member_id,
+                    DBUserActionSummary.product_id == product_id
+                ).first()
+                
+                if db_summary:
+                    return UserActionSummary(
+                        member_id=db_summary.member_id,
+                        product_id=db_summary.product_id,
+                        clicked=db_summary.clicked or 0,
+                        liked=db_summary.liked,
+                        in_cart=db_summary.in_cart,
+                        purchased=db_summary.purchased,
+                        clicked_at=db_summary.clicked_at,
+                        liked_at=db_summary.liked_at,
+                        in_cart_at=db_summary.in_cart_at,
+                        purchased_at=db_summary.purchased_at,
+                        last_updated=db_summary.last_updated,
+                        category_id=db_summary.category_id,
+                        brand_id=db_summary.brand_id,
+                        price=db_summary.price,
+                        session_id=db_summary.last_session_id
+                    )
+            except Exception as e:
+                print(f"⚠️ DB 조회 실패: {e}")
+        
+        # 기본값 반환
+        return UserActionSummary(member_id, product_id, 0, False, False, False)
+    
+    def update_user_action(
+        self,
+        member_id: int,
+        product_id: int,
+        clicked: int = 0,
+        liked: Optional[bool] = None,
+        in_cart: Optional[bool] = None,
+        purchased: Optional[bool] = None,
+        # 추가 메타데이터
+        category_id: Optional[int] = None,
+        brand_id: Optional[int] = None,
+        price: Optional[int] = None,
+        session_id: Optional[str] = None
+    ) -> UserActionSummary:
+        """
+        사용자 행동 업데이트
+        
+        Args:
+            member_id: 사용자 ID
+            product_id: 상품 ID
+            clicked: 클릭 횟수 증가량
+            liked: 좋아요 여부
+            in_cart: 장바구니 추가 여부
+            purchased: 구매 여부
+        
+        Returns:
+            업데이트된 UserActionSummary
+        """
+        # 기존 요약 조회
+        summary = self._get_user_action_summary(member_id, product_id)
+        now = datetime.now()
+        
+        # 행동 값 업데이트
+        if clicked > 0:
+            summary.clicked = (summary.clicked or 0) + clicked
+            summary.clicked_at = now
+        
+        if liked is not None:
+            summary.liked = liked
+            summary.liked_at = now if liked else None
+        
+        if in_cart is not None:
+            summary.in_cart = in_cart
+            summary.in_cart_at = now if in_cart else None
+        
+        if purchased is not None:
+            summary.purchased = purchased
+            summary.purchased_at = now if purchased else None
+        
+        # 메타데이터 업데이트 (최신 정보로 갱신)
+        if category_id is not None:
+            summary.category_id = category_id
+        if brand_id is not None:
+            summary.brand_id = brand_id
+        if price is not None:
+            summary.price = price
+        if session_id is not None:
+            summary.session_id = session_id
+        
+        summary.last_updated = now
+        
+        # Redis 캐시에 저장
+        if self.redis_client:
+            try:
+                cache_key = f"user:action:{member_id}:{product_id}"
+                # TODO: JSON 직렬화 구현
+                # self.redis_client.setex(cache_key, CACHE_TTL_MINUTES * 60, summary)
+            except Exception as e:
+                print(f"⚠️ Redis 캐시 저장 실패: {e}")
+        
+        # DB에 저장
+        if self.db_session:
+            try:
+                from services.database import UserActionSummary as DBUserActionSummary
+                
+                db_summary = self.db_session.query(DBUserActionSummary).filter(
+                    DBUserActionSummary.member_id == member_id,
+                    DBUserActionSummary.product_id == product_id
+                ).first()
+                
+                if db_summary:
+                    # 업데이트
+                    db_summary.clicked = summary.clicked
+                    db_summary.liked = summary.liked
+                    db_summary.in_cart = summary.in_cart
+                    db_summary.purchased = summary.purchased
+                    db_summary.clicked_at = summary.clicked_at
+                    db_summary.liked_at = summary.liked_at
+                    db_summary.in_cart_at = summary.in_cart_at
+                    db_summary.purchased_at = summary.purchased_at
+                    db_summary.last_updated = summary.last_updated
+                    # 메타데이터 업데이트
+                    if summary.category_id is not None:
+                        db_summary.category_id = summary.category_id
+                    if summary.brand_id is not None:
+                        db_summary.brand_id = summary.brand_id
+                    if summary.price is not None:
+                        db_summary.price = summary.price
+                    if summary.session_id is not None:
+                        db_summary.last_session_id = summary.session_id
+                else:
+                    # 새로 생성
+                    db_summary = DBUserActionSummary(
+                        member_id=summary.member_id,
+                        product_id=summary.product_id,
+                        clicked=summary.clicked,
+                        liked=summary.liked,
+                        in_cart=summary.in_cart,
+                        purchased=summary.purchased,
+                        clicked_at=summary.clicked_at,
+                        liked_at=summary.liked_at,
+                        in_cart_at=summary.in_cart_at,
+                        purchased_at=summary.purchased_at,
+                        last_updated=summary.last_updated,
+                        category_id=summary.category_id,
+                        brand_id=summary.brand_id,
+                        price=summary.price,
+                        last_session_id=summary.session_id
+                    )
+                    self.db_session.add(db_summary)
+                
+                self.db_session.commit()
+            except Exception as e:
+                print(f"⚠️ DB 저장 실패: {e}")
+                if self.db_session:
+                    self.db_session.rollback()
+        
+        return summary
+    
+    def process_stream_message(self, fields: Dict[str, Any]) -> None:
+        """
+        Redis Stream에서 받은 메시지 처리
+        
+        실제 로그 형식:
+        {
+            "event_time": "2025-01-15T10:30:45.123Z",
+            "session_id": "uuid",
+            "version": "1",
+            "event_type": "product_like",  // product_detail_view, product_like 등
+            "service": "product",
+            "member_id": "1001",  // 문자열로 저장됨
+            "data.product_id": "123"  // 문자열로 저장됨
+        }
+        
+        Args:
+            fields: Stream 메시지의 필드 딕셔너리
+        """
+        try:
+            # 필수 필드 파싱 (문자열로 저장되므로 변환 필요)
+            member_id_str = fields.get("member_id", "0")
+            event_type = fields.get("event_type", "")
+            service = fields.get("service", "")
+            
+            # member_id를 정수로 변환
+            try:
+                member_id = int(member_id_str) if member_id_str else 0
+            except (ValueError, TypeError):
+                print(f"⚠️ 잘못된 member_id 형식: {member_id_str}")
+                return
+            
+            # data. 접두사 제거하여 data 딕셔너리 생성
+            data = {k[5:]: v for k, v in fields.items() if k.startswith("data.")}
+            
+            # product_id 파싱 (문자열로 저장되므로 변환 필요)
+            product_id_str = data.get("product_id", "0")
+            try:
+                product_id = int(product_id_str) if product_id_str else 0
+            except (ValueError, TypeError):
+                print(f"⚠️ 잘못된 product_id 형식: {product_id_str}")
+                return
+            
+            # 추가 메타데이터 파싱 (정밀한 추천을 위해)
+            category_id = None
+            brand_id = None
+            price = None
+            session_id = fields.get("session_id")
+            
+            # data에서 추가 정보 추출
+            category_id_str = data.get("category_id") or data.get("categoryId")
+            if category_id_str:
+                try:
+                    category_id = int(category_id_str)
+                except (ValueError, TypeError):
+                    pass
+            
+            brand_id_str = data.get("brand_id") or data.get("brandId")
+            if brand_id_str:
+                try:
+                    brand_id = int(brand_id_str)
+                except (ValueError, TypeError):
+                    pass
+            
+            price_str = data.get("price")
+            if price_str:
+                try:
+                    price = int(float(price_str))  # 소수점도 처리
+                except (ValueError, TypeError):
+                    pass
+            
+            # 유효성 검사
+            if member_id == 0 or product_id == 0:
+                return
+            
+            # service가 "product"가 아니면 무시 (다른 서비스 로그는 제외)
+            if service != "product":
+                return
+            
+            # 조회성 이벤트(검색/목록/상세 조회 등) 기본 무시
+            if event_type.startswith(self.readonly_event_prefixes) or event_type.endswith(self.readonly_event_suffixes):
+                # product_detail은 추천 신호로 사용하므로 예외 처리
+                if event_type != "product_detail":
+                    return
+            
+            # 이벤트 타입에 따라 행동 업데이트
+            clicked = 0
+            liked = None
+            in_cart = None
+            purchased = None
+            
+            # 권장 이벤트명
+            if event_type == "product_detail":
+                clicked = 1
+            elif event_type == "product_like":
+                liked = True
+            elif event_type == "cancel_product_like":
+                liked = False
+            elif event_type == "create_cart" or event_type == "product_add_to_cart" or event_type == "add_to_cart":
+                in_cart = True
+            elif event_type == "delete_cart" or event_type == "product_remove_from_cart" or event_type == "remove_from_cart":
+                in_cart = False
+            elif event_type == "end_payment" or event_type == "product_purchase" or event_type == "purchase":
+                purchased = True
+            elif event_type == "refund":
+                purchased = False
+            # 기존 형식도 지원 (하위 호환성)
+            elif event_type == "view" or event_type == "click":
+                clicked = 1
+            elif event_type == "like":
+                liked = True
+            elif event_type == "unlike":
+                liked = False
+            
+            # 행동이 없으면 무시
+            if clicked == 0 and liked is None and in_cart is None and purchased is None:
+                return
+            
+            # 사용자 행동 업데이트 (메타데이터 포함)
+            summary = self.update_user_action(
+                member_id=member_id,
+                product_id=product_id,
+                clicked=clicked,
+                liked=liked,
+                in_cart=in_cart,
+                purchased=purchased,
+                category_id=category_id,
+                brand_id=brand_id,
+                price=price,
+                session_id=session_id
+            )
+            
+            # 추천 점수 계산
+            score = self.get_recommendation_score(member_id, product_id, summary)
+            
+            # 추천 점수가 높으면 UserRecommendation에 저장 (상위 8개만 유지)
+            if score > 0 and self.db_session:
+                self._update_user_recommendation(member_id, product_id, score)
+            
+            # 로그 출력 (디버깅용, 나중에 제거 가능)
+            if score > 0:
+                print(f"📊 [추천] member={member_id}, product={product_id}, event={event_type}, score={score:.2f}")
+            
+        except Exception as e:
+            print(f"❌ 메시지 처리 중 오류: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _update_user_recommendation(self, member_id: int, product_id: int, score: float) -> None:
+        """
+        사용자 추천 결과 업데이트 (상위 8개만 유지)
+        
+        Args:
+            member_id: 사용자 ID
+            product_id: 상품 ID
+            score: 추천 점수
+        """
+        if not self.db_session:
+            return
+        
+        try:
+            from services.database import UserRecommendation
+            
+            # 기존 추천이 있는지 확인
+            existing = self.db_session.query(UserRecommendation).filter(
+                UserRecommendation.member_id == member_id,
+                UserRecommendation.product_id == product_id
+            ).first()
+            
+            if existing:
+                # 점수 업데이트
+                existing.score = score
+                existing.updated_at = datetime.now()
+            else:
+                # 새로 추가
+                recommendation = UserRecommendation(
+                    member_id=member_id,
+                    product_id=product_id,
+                    score=score
+                )
+                self.db_session.add(recommendation)
+            
+            # 상위 8개만 유지 (나머지 삭제)
+            all_recommendations = self.db_session.query(UserRecommendation).filter(
+                UserRecommendation.member_id == member_id
+            ).order_by(UserRecommendation.score.desc()).all()
+            
+            if len(all_recommendations) > 8:
+                for rec in all_recommendations[8:]:
+                    self.db_session.delete(rec)
+            
+            self.db_session.commit()
+        except Exception as e:
+            print(f"⚠️ 추천 결과 저장 실패: {e}")
+            if self.db_session:
+                self.db_session.rollback()
+

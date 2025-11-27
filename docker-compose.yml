@@ -11,7 +11,41 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - .:/app
+    ports:
+      - "8001:8001"  # FastAPI 서버 포트
+      - "8002:8002"  # Consumer-0 Prometheus metrics
+      - "8003:8003"  # Consumer-1 Prometheus metrics
+      - "8004:8004"  # Consumer-2 Prometheus metrics
+      - "8005:8005"  # Consumer-3 Prometheus metrics
+      - "8006:8006"  # Consumer-4 Prometheus metrics
+      - "8007:8007"  # Consumer-5 Prometheus metrics
+      - "8008:8008"  # Consumer-6 Prometheus metrics
+      - "8009:8009"  # Consumer-7 Prometheus metrics
+      - "8010:8010"  # Consumer-8 Prometheus metrics
+      - "8011:8011"  # Consumer-9 Prometheus metrics
+    depends_on:
+      - mongodb
 
+  mongodb:
+    image: mongo:8.2
+    container_name: recommend-mongodb
+    restart: always
+    networks:
+      - munova-net
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=admin123
+      - MONGO_INITDB_DATABASE=recommend
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+    command: mongod --wiredTigerCacheSizeGB 1
+
+volumes:
+  mongodb_data:
+  mongodb_config:
 
 networks:
   munova-net:
