@@ -11,17 +11,21 @@ python3 -m uvicorn services.api_server:app --host 0.0.0.0 --port 8001 &
 API_PID=$!
 echo "✅ FastAPI 서버 시작됨 (PID: $API_PID)"
 
-# FastAPI 서버가 시작될 때까지 잠시 대기
-sleep 3
-
-# 2. Redis Stream Consumer 시작 (Redis 연결 실패 시 종료됨)
-echo "🔄 Redis Stream Consumer 시작..."
-bash services/redis/start_all_consumers.sh &
-CONSUMER_PID=$!
-echo "✅ Consumer 시작됨 (PID: $CONSUMER_PID)"
+# 2. Kafka Consumer 10개 시작 (백그라운드)
+echo "📨 Kafka Consumer 10개 시작..."
+CONSUMER_PIDS=()
+for i in {0..9}; do
+    METRICS_PORT=$((9000 + i))
+    export KAFKA_METRICS_PORT=$METRICS_PORT
+    python3 -m services.kafka.kafka_consumer &
+    CONSUMER_PIDS+=($!)
+    echo "✅ Consumer-$i 시작됨 (PID: ${CONSUMER_PIDS[$i]}, 메트릭 포트: $METRICS_PORT)"
+    sleep 0.5  # 각 Consumer 시작 간격
+done
+echo "✅ 총 ${#CONSUMER_PIDS[@]}개 Consumer 시작 완료"
 
 # 종료 시그널 처리
-trap "echo '🛑 서버 종료 중...'; kill $API_PID $CONSUMER_PID 2>/dev/null; wait; exit" SIGTERM SIGINT
+trap "echo '🛑 서버 종료 중...'; kill $API_PID 2>/dev/null; for pid in ${CONSUMER_PIDS[@]}; do kill \$pid 2>/dev/null; done; wait; exit" SIGTERM SIGINT
 
 # 대기
 echo "⏳ 서버가 실행 중입니다."

@@ -154,8 +154,8 @@ def save_user_action_log(
         product_id: 상품 ID
         event_type: 이벤트 타입
         fields: 원본 이벤트 필드
-        stream_key: Redis Stream 키
-        message_id: Redis Stream 메시지 ID
+    stream_key: Kafka Topic (이전 Redis Stream 키, 호환성 유지)
+    message_id: Kafka Offset (이전 Redis Stream 메시지 ID, 호환성 유지)
     
     Returns:
         저장 성공 여부
@@ -181,6 +181,58 @@ def save_user_action_log(
         return True
     except Exception as e:
         print(f"⚠️ 사용자 행동 로그 저장 실패: {e}")
+        return False
+
+
+def save_user_action_logs_batch(documents: List[Dict[str, Any]]) -> bool:
+    """
+    사용자 행동 로그를 배치로 MongoDB에 저장 (성능 최적화)
+    
+    Args:
+        documents: 저장할 문서 리스트 (이미 포맷된 문서)
+    
+    Returns:
+        저장 성공 여부
+    """
+    if not documents:
+        return True
+    
+    db = get_mongodb_db()
+    if db is None:
+        return False
+    
+    try:
+        collection = db[COLLECTION_USER_ACTION_LOGS]
+        collection.insert_many(documents, ordered=False)  # ordered=False: 일부 실패해도 계속 진행
+        return True
+    except Exception as e:
+        print(f"⚠️ 사용자 행동 로그 배치 저장 실패: {e}")
+        return False
+
+
+def save_recommendation_logs_batch(documents: List[Dict[str, Any]]) -> bool:
+    """
+    추천 로그를 배치로 MongoDB에 저장 (성능 최적화)
+    
+    Args:
+        documents: 저장할 문서 리스트 (이미 포맷된 문서)
+    
+    Returns:
+        저장 성공 여부
+    """
+    if not documents:
+        return True
+    
+    db = get_mongodb_db()
+    if db is None:
+        return False
+    
+    try:
+        collection = db[COLLECTION_RECOMMENDATION_LOGS]
+        collection.insert_many(documents, ordered=False)  # ordered=False: 일부 실패해도 계속 진행
+        return True
+    except Exception as e:
+        print(f"⚠️ 추천 로그 배치 저장 실패: {e}")
         return False
 
 

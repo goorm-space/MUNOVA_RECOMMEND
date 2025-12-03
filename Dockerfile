@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
-RUN chmod +x services/redis/start_all_consumers.sh
+RUN chmod +x services/kafka/start_kafka_consumer.sh
 RUN chmod +x services/start_server.sh
 
 CMD ["bash", "services/start_server.sh"]

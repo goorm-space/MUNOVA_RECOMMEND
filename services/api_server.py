@@ -6,8 +6,6 @@ from fastapi.responses import Response
 from typing import List, Optional
 from sqlalchemy.orm import Session
 import yaml
-from redis.cluster import RedisCluster, ClusterNode
-from redis.exceptions import ConnectionError, TimeoutError
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 # 설정 로드 (로컬/도커 환경 모두 지원)
@@ -26,61 +24,22 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# 전역 Redis 클라이언트 및 Recommender
-redis_client: Optional[RedisCluster] = None
+# 전역 Recommender
 recommender: Optional[Recommender] = None
-
-
-def create_redis_client():
-    """Redis Cluster 클라이언트 생성 (재연결용)"""
-    nodes = [ClusterNode(n["host"], n["port"]) for n in config["redis"]["cluster"]["nodes"]]
-    password = config["redis"]["cluster"].get("password", "")
-    return RedisCluster(
-        startup_nodes=nodes,
-        password=password if password else None,
-        decode_responses=True,
-        skip_full_coverage_check=True,  # 일부 노드 연결 실패해도 계속 진행
-        socket_connect_timeout=10,
-        socket_timeout=10,
-        retry_on_timeout=True,
-        health_check_interval=30,  # 30초마다 연결 상태 확인
-        read_from_replicas=False,  # 마스터에서만 읽기
-        reinitialize_steps=10  # 10번 실패 시 재초기화
-    )
 
 
 @app.on_event("startup")
 async def startup_event():
-    """서버 시작 시 Redis 클라이언트 및 Recommender 초기화"""
-    global redis_client, recommender
+    """서버 시작 시 Recommender 초기화"""
+    global recommender
     
     try:
-        # Redis Cluster 연결
-        redis_client = create_redis_client()
-        # 연결 테스트
-        redis_client.ping()
-        print("✅ Redis Cluster 연결 완료 (FastAPI)")
-        
         # Recommender 초기화 (DB 세션은 매 요청마다 생성)
-        recommender = Recommender(redis_client=redis_client, db_session=None)
+        recommender = Recommender(db_session=None)
         print("✅ Recommender 초기화 완료")
     except Exception as e:
-        print(f"⚠️ Redis Cluster 연결 실패: {e}")
-        print("⚠️ Redis 없이도 API 서버는 동작하지만, 추천 점수 계산 기능은 사용할 수 없습니다.")
-        redis_client = None
+        print(f"⚠️ Recommender 초기화 실패: {e}")
         recommender = None
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """서버 종료 시 Redis 클라이언트 종료"""
-    global redis_client
-    if redis_client:
-        try:
-            redis_client.close()
-            print("✅ Redis Cluster 연결 종료")
-        except Exception as e:
-            print(f"⚠️ Redis 연결 종료 중 오류: {e}")
 
 
 @app.get("/")
@@ -214,27 +173,10 @@ def get_recommendation_score(
     Returns:
         추천 점수 (0~100)
     """
-    global redis_client, recommender
+    global recommender
     
     if recommender is None:
-        raise HTTPException(status_code=500, detail="Recommender가 초기화되지 않았습니다. Redis 연결을 확인하세요.")
-    
-    # Redis 연결 상태 확인 및 재연결
-    if redis_client:
-        try:
-            redis_client.ping()
-        except (ConnectionError, TimeoutError) as e:
-            print(f"⚠️ Redis 연결 끊김 감지: {e}. 재연결 시도...")
-            try:
-                redis_client.close()
-                redis_client = create_redis_client()
-                redis_client.ping()
-                # Recommender에도 새 클라이언트 전달
-                recommender.redis_client = redis_client
-                print("✅ Redis 재연결 성공")
-            except Exception as reconnect_e:
-                print(f"❌ Redis 재연결 실패: {reconnect_e}")
-                raise HTTPException(status_code=500, detail="Redis 연결이 끊어졌고 재연결에 실패했습니다.")
+        raise HTTPException(status_code=500, detail="Recommender가 초기화되지 않았습니다.")
     
     try:
         # DB 세션을 Recommender에 설정
@@ -248,8 +190,6 @@ def get_recommendation_score(
             "product_id": product_id,
             "score": round(score, 2)
         }
-    except (ConnectionError, TimeoutError) as e:
-        raise HTTPException(status_code=500, detail=f"Redis 연결 오류: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"추천 점수 계산 실패: {str(e)}")
 

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import math
+from services.mongodb import save_user_action_log, save_recommendation_log
 
 # 가중치 상수
 CLICK_WEIGHT = 0.1
@@ -52,13 +53,11 @@ class UserActionSummary:
 
 
 class Recommender:
-    def __init__(self, redis_client=None, db_session=None):
+    def __init__(self, db_session=None):
         """
         Args:
-            redis_client: Redis 클라이언트 (캐시용)
             db_session: 데이터베이스 세션 (SQLAlchemy Session) - None일 수 있음 (매 요청마다 설정 가능)
         """
-        self.redis_client = redis_client
         self.db_session = db_session  # 매 요청마다 설정 가능하도록 함
         # 처리 대상 이벤트(추천 반영)
         self.supported_events = {
@@ -140,7 +139,7 @@ class Recommender:
         product_id: int
     ) -> UserActionSummary:
         """
-        사용자 행동 요약 조회 (Redis 캐시 우선)
+        사용자 행동 요약 조회
         
         Args:
             member_id: 사용자 ID
@@ -149,18 +148,6 @@ class Recommender:
         Returns:
             UserActionSummary 객체
         """
-        cache_key = f"user:action:{member_id}:{product_id}"
-        
-        # Redis 캐시에서 조회
-        if self.redis_client:
-            try:
-                cached = self.redis_client.get(cache_key)
-                if cached:
-                    # TODO: JSON 역직렬화 구현
-                    pass
-            except Exception as e:
-                print(f"⚠️ Redis 캐시 조회 실패: {e}")
-        
         # DB에서 조회
         if self.db_session:
             try:
@@ -255,15 +242,6 @@ class Recommender:
         
         summary.last_updated = now
         
-        # Redis 캐시에 저장
-        if self.redis_client:
-            try:
-                cache_key = f"user:action:{member_id}:{product_id}"
-                # TODO: JSON 직렬화 구현
-                # self.redis_client.setex(cache_key, CACHE_TTL_MINUTES * 60, summary)
-            except Exception as e:
-                print(f"⚠️ Redis 캐시 저장 실패: {e}")
-        
         # DB에 저장
         if self.db_session:
             try:
@@ -325,7 +303,7 @@ class Recommender:
     
     def process_stream_message(self, fields: Dict[str, Any]) -> None:
         """
-        Redis Stream에서 받은 메시지 처리
+        Redis Stream에서 받은 메시지 처리 (하위 호환성 유지 - Kafka로 전환됨)
         
         실제 로그 형식:
         {
@@ -518,4 +496,150 @@ class Recommender:
             print(f"⚠️ 추천 결과 저장 실패: {e}")
             if self.db_session:
                 self.db_session.rollback()
+    
+    def process_kafka_message(self, kafka_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Kafka에서 받은 메시지 직접 처리
+        
+        Kafka 메시지 형식:
+        {
+            "eventType": "product_detail_view",
+            "service": "product",
+            "memberId": 12345,
+            "data": {
+                "product_id": 67890
+            },
+            "eventTime": "2024-01-01T00:00:00Z",
+            "eventTimestamp": 1704067200000,
+            "producerTime": 1704067200000,
+            "version": 1
+        }
+        
+        Args:
+            kafka_data: Kafka에서 받은 JSON 메시지 딕셔너리
+        
+        Returns:
+            MongoDB 저장용 메타데이터 딕셔너리 (score, category_id 등 포함) 또는 None
+        """
+        try:
+            # 필수 필드 추출
+            event_type = kafka_data.get('eventType', '')
+            service = kafka_data.get('service', '')
+            member_id = kafka_data.get('memberId', 0)
+            data = kafka_data.get('data', {})
+            
+            # 유효성 검사
+            if not member_id or not isinstance(member_id, int):
+                return
+            
+            # product_id 추출
+            product_id = data.get('product_id') or data.get('productId', 0)
+            if not product_id or not isinstance(product_id, int):
+                return
+            
+            # service가 "product"가 아니면 무시
+            if service != "product":
+                return
+            
+            # 이벤트 타입 매핑 (Kafka 형식 -> 내부 형식)
+            event_type_mapping = {
+                'product_detail_view': 'product_detail',
+                'product_add_cart': 'create_cart',
+            }
+            event_type = event_type_mapping.get(event_type, event_type)
+            
+            # 조회성 이벤트 무시 (product_detail은 예외)
+            if event_type.startswith(self.readonly_event_prefixes) or event_type.endswith(self.readonly_event_suffixes):
+                if event_type != "product_detail":
+                    return
+            
+            # 추가 메타데이터 추출
+            category_id = data.get('category_id') or data.get('categoryId')
+            brand_id = data.get('brand_id') or data.get('brandId')
+            price = data.get('price')
+            session_id = kafka_data.get('sessionId') or kafka_data.get('session_id')
+            
+            # 타입 변환
+            if category_id:
+                try:
+                    category_id = int(category_id)
+                except (ValueError, TypeError):
+                    category_id = None
+            
+            if brand_id:
+                try:
+                    brand_id = int(brand_id)
+                except (ValueError, TypeError):
+                    brand_id = None
+            
+            if price:
+                try:
+                    price = int(float(price))
+                except (ValueError, TypeError):
+                    price = None
+            
+            # 이벤트 타입에 따라 행동 업데이트
+            clicked = 0
+            liked = None
+            in_cart = None
+            purchased = None
+            
+            if event_type == "product_detail" or event_type == "product_detail_view":
+                clicked = 1
+            elif event_type == "product_like":
+                liked = True
+            elif event_type == "cancel_product_like":
+                liked = False
+            elif event_type == "create_cart" or event_type == "product_add_cart":
+                in_cart = True
+            elif event_type == "delete_cart":
+                in_cart = False
+            elif event_type == "end_payment" or event_type == "product_purchase":
+                purchased = True
+            elif event_type == "refund":
+                purchased = False
+            
+            # 행동이 없으면 무시
+            if clicked == 0 and liked is None and in_cart is None and purchased is None:
+                return
+            
+            # 사용자 행동 업데이트
+            summary = self.update_user_action(
+                member_id=member_id,
+                product_id=product_id,
+                clicked=clicked,
+                liked=liked,
+                in_cart=in_cart,
+                purchased=purchased,
+                category_id=category_id,
+                brand_id=brand_id,
+                price=price,
+                session_id=session_id
+            )
+            
+            # 추천 점수 계산
+            score = self.get_recommendation_score(member_id, product_id, summary)
+            
+            # 추천 점수가 높으면 UserRecommendation에 저장
+            if score > 0 and self.db_session:
+                self._update_user_recommendation(member_id, product_id, score)
+            
+            # MongoDB 배치 저장을 위한 메타데이터 반환
+            kafka_metadata = kafka_data.get('_kafka_metadata', {})
+            return {
+                'member_id': member_id,
+                'product_id': product_id,
+                'event_type': event_type,
+                'score': score,
+                'category_id': category_id,
+                'brand_id': brand_id,
+                'price': price,
+                'kafka_metadata': kafka_metadata
+            }
+            
+        except Exception as e:
+            print(f"❌ Kafka 메시지 처리 중 오류: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
