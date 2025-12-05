@@ -1,7 +1,11 @@
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import math
-from services.mongodb import save_user_action_log, save_recommendation_log
+from services.mongodb import (
+    save_user_action_log, save_recommendation_log,
+    save_user_action_summary, get_user_action_summary,
+    save_user_recommendation
+)
 
 # 가중치 상수
 CLICK_WEIGHT = 0.1
@@ -56,9 +60,10 @@ class Recommender:
     def __init__(self, db_session=None):
         """
         Args:
-            db_session: 데이터베이스 세션 (SQLAlchemy Session) - None일 수 있음 (매 요청마다 설정 가능)
+            db_session: (사용하지 않음, MongoDB로 전환됨) 하위 호환성을 위해 유지
         """
-        self.db_session = db_session  # 매 요청마다 설정 가능하도록 함
+        # MySQL 제거됨, MongoDB만 사용
+        pass
         # 처리 대상 이벤트(추천 반영)
         self.supported_events = {
             "product_detail",
@@ -139,7 +144,7 @@ class Recommender:
         product_id: int
     ) -> UserActionSummary:
         """
-        사용자 행동 요약 조회
+        사용자 행동 요약 조회 (MongoDB에서 조회)
         
         Args:
             member_id: 사용자 ID
@@ -148,35 +153,31 @@ class Recommender:
         Returns:
             UserActionSummary 객체
         """
-        # DB에서 조회
-        if self.db_session:
-            try:
-                from services.database import UserActionSummary as DBUserActionSummary
-                db_summary = self.db_session.query(DBUserActionSummary).filter(
-                    DBUserActionSummary.member_id == member_id,
-                    DBUserActionSummary.product_id == product_id
-                ).first()
-                
-                if db_summary:
-                    return UserActionSummary(
-                        member_id=db_summary.member_id,
-                        product_id=db_summary.product_id,
-                        clicked=db_summary.clicked or 0,
-                        liked=db_summary.liked,
-                        in_cart=db_summary.in_cart,
-                        purchased=db_summary.purchased,
-                        clicked_at=db_summary.clicked_at,
-                        liked_at=db_summary.liked_at,
-                        in_cart_at=db_summary.in_cart_at,
-                        purchased_at=db_summary.purchased_at,
-                        last_updated=db_summary.last_updated,
-                        category_id=db_summary.category_id,
-                        brand_id=db_summary.brand_id,
-                        price=db_summary.price,
-                        session_id=db_summary.last_session_id
-                    )
-            except Exception as e:
-                print(f"⚠️ DB 조회 실패: {e}")
+        # MongoDB에서 조회
+        try:
+            doc = get_user_action_summary(member_id, product_id)
+            
+            if doc:
+                # MongoDB 문서를 UserActionSummary로 변환
+                return UserActionSummary(
+                    member_id=doc.get("member_id", member_id),
+                    product_id=doc.get("product_id", product_id),
+                    clicked=doc.get("clicked", 0) or 0,
+                    liked=doc.get("liked"),
+                    in_cart=doc.get("in_cart"),
+                    purchased=doc.get("purchased"),
+                    clicked_at=doc.get("clicked_at"),
+                    liked_at=doc.get("liked_at"),
+                    in_cart_at=doc.get("in_cart_at"),
+                    purchased_at=doc.get("purchased_at"),
+                    last_updated=doc.get("last_updated"),
+                    category_id=doc.get("category_id"),
+                    brand_id=doc.get("brand_id"),
+                    price=doc.get("price"),
+                    session_id=doc.get("last_session_id")
+                )
+        except Exception as e:
+            print(f"⚠️ MongoDB 조회 실패: {e}")
         
         # 기본값 반환
         return UserActionSummary(member_id, product_id, 0, False, False, False)
@@ -242,62 +243,26 @@ class Recommender:
         
         summary.last_updated = now
         
-        # DB에 저장
-        if self.db_session:
-            try:
-                from services.database import UserActionSummary as DBUserActionSummary
-                
-                db_summary = self.db_session.query(DBUserActionSummary).filter(
-                    DBUserActionSummary.member_id == member_id,
-                    DBUserActionSummary.product_id == product_id
-                ).first()
-                
-                if db_summary:
-                    # 업데이트
-                    db_summary.clicked = summary.clicked
-                    db_summary.liked = summary.liked
-                    db_summary.in_cart = summary.in_cart
-                    db_summary.purchased = summary.purchased
-                    db_summary.clicked_at = summary.clicked_at
-                    db_summary.liked_at = summary.liked_at
-                    db_summary.in_cart_at = summary.in_cart_at
-                    db_summary.purchased_at = summary.purchased_at
-                    db_summary.last_updated = summary.last_updated
-                    # 메타데이터 업데이트
-                    if summary.category_id is not None:
-                        db_summary.category_id = summary.category_id
-                    if summary.brand_id is not None:
-                        db_summary.brand_id = summary.brand_id
-                    if summary.price is not None:
-                        db_summary.price = summary.price
-                    if summary.session_id is not None:
-                        db_summary.last_session_id = summary.session_id
-                else:
-                    # 새로 생성
-                    db_summary = DBUserActionSummary(
-                        member_id=summary.member_id,
-                        product_id=summary.product_id,
-                        clicked=summary.clicked,
-                        liked=summary.liked,
-                        in_cart=summary.in_cart,
-                        purchased=summary.purchased,
-                        clicked_at=summary.clicked_at,
-                        liked_at=summary.liked_at,
-                        in_cart_at=summary.in_cart_at,
-                        purchased_at=summary.purchased_at,
-                        last_updated=summary.last_updated,
-                        category_id=summary.category_id,
-                        brand_id=summary.brand_id,
-                        price=summary.price,
-                        last_session_id=summary.session_id
-                    )
-                    self.db_session.add(db_summary)
-                
-                self.db_session.commit()
-            except Exception as e:
-                print(f"⚠️ DB 저장 실패: {e}")
-                if self.db_session:
-                    self.db_session.rollback()
+        # MongoDB에 저장
+        try:
+            save_user_action_summary(
+                member_id=summary.member_id,
+                product_id=summary.product_id,
+                clicked=summary.clicked,
+                liked=summary.liked,
+                in_cart=summary.in_cart,
+                purchased=summary.purchased,
+                clicked_at=summary.clicked_at,
+                liked_at=summary.liked_at,
+                in_cart_at=summary.in_cart_at,
+                purchased_at=summary.purchased_at,
+                category_id=summary.category_id,
+                brand_id=summary.brand_id,
+                price=summary.price,
+                session_id=summary.session_id
+            )
+        except Exception as e:
+            print(f"⚠️ MongoDB 저장 실패: {e}")
         
         return summary
     
@@ -435,9 +400,9 @@ class Recommender:
             # 추천 점수 계산
             score = self.get_recommendation_score(member_id, product_id, summary)
             
-            # 추천 점수가 높으면 UserRecommendation에 저장 (상위 8개만 유지)
-            if score > 0 and self.db_session:
-                self._update_user_recommendation(member_id, product_id, score)
+            # 추천 점수가 높으면 MongoDB에 저장 (상위 8개만 유지)
+            if score > 0:
+                save_user_recommendation(member_id, product_id, score)
             
             # 로그 출력 (디버깅용, 나중에 제거 가능)
             if score > 0:
@@ -450,52 +415,15 @@ class Recommender:
     
     def _update_user_recommendation(self, member_id: int, product_id: int, score: float) -> None:
         """
-        사용자 추천 결과 업데이트 (상위 8개만 유지)
+        사용자 추천 결과 업데이트 (상위 8개만 유지) - MongoDB 사용
         
         Args:
             member_id: 사용자 ID
             product_id: 상품 ID
             score: 추천 점수
         """
-        if not self.db_session:
-            return
-        
-        try:
-            from services.database import UserRecommendation
-            
-            # 기존 추천이 있는지 확인
-            existing = self.db_session.query(UserRecommendation).filter(
-                UserRecommendation.member_id == member_id,
-                UserRecommendation.product_id == product_id
-            ).first()
-            
-            if existing:
-                # 점수 업데이트
-                existing.score = score
-                existing.updated_at = datetime.now()
-            else:
-                # 새로 추가
-                recommendation = UserRecommendation(
-                    member_id=member_id,
-                    product_id=product_id,
-                    score=score
-                )
-                self.db_session.add(recommendation)
-            
-            # 상위 8개만 유지 (나머지 삭제)
-            all_recommendations = self.db_session.query(UserRecommendation).filter(
-                UserRecommendation.member_id == member_id
-            ).order_by(UserRecommendation.score.desc()).all()
-            
-            if len(all_recommendations) > 8:
-                for rec in all_recommendations[8:]:
-                    self.db_session.delete(rec)
-            
-            self.db_session.commit()
-        except Exception as e:
-            print(f"⚠️ 추천 결과 저장 실패: {e}")
-            if self.db_session:
-                self.db_session.rollback()
+        # MongoDB에 저장 (상위 8개만 유지하는 로직은 save_user_recommendation 내부에서 처리)
+        save_user_recommendation(member_id, product_id, score)
     
     def process_kafka_message(self, kafka_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
@@ -620,9 +548,9 @@ class Recommender:
             # 추천 점수 계산
             score = self.get_recommendation_score(member_id, product_id, summary)
             
-            # 추천 점수가 높으면 UserRecommendation에 저장
-            if score > 0 and self.db_session:
-                self._update_user_recommendation(member_id, product_id, score)
+            # 추천 점수가 높으면 MongoDB에 저장 (상위 8개만 유지)
+            if score > 0:
+                save_user_recommendation(member_id, product_id, score)
             
             # MongoDB 배치 저장을 위한 메타데이터 반환
             kafka_metadata = kafka_data.get('_kafka_metadata', {})

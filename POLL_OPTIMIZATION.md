@@ -207,3 +207,4 @@ docker restart recommend
 
 **예상 CPU 감소**: 80% → 30-40%
 
+

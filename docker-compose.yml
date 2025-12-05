@@ -9,6 +9,7 @@ services:
       - munova-net
     environment:
       - PYTHONUNBUFFERED=1
+      - KAFKA_CONSUMER_COUNT=10  # Consumer 개수 (초당 1만 처리: 5 -> 10)
     volumes:
       - .:/app
     ports:
@@ -23,6 +24,7 @@ services:
       - "9007:9007"  # Kafka Consumer-7 Prometheus metrics
       - "9008:9008"  # Kafka Consumer-8 Prometheus metrics
       - "9009:9009"  # Kafka Consumer-9 Prometheus metrics
+
     depends_on:
       - mongodb
 

@@ -11,10 +11,12 @@ python3 -m uvicorn services.api_server:app --host 0.0.0.0 --port 8001 &
 API_PID=$!
 echo "✅ FastAPI 서버 시작됨 (PID: $API_PID)"
 
-# 2. Kafka Consumer 10개 시작 (백그라운드)
-echo "📨 Kafka Consumer 10개 시작..."
+# 2. Kafka Consumer 시작 (백그라운드)
+# Consumer 개수는 config.yml의 consumer_count에서 가져오거나 기본값 5개 사용
+echo "📨 Kafka Consumer 시작..."
 CONSUMER_PIDS=()
-for i in {0..9}; do
+CONSUMER_COUNT=${KAFKA_CONSUMER_COUNT:-5}  # 환경변수 또는 기본값 5개
+for i in $(seq 0 $((CONSUMER_COUNT - 1))); do
     METRICS_PORT=$((9000 + i))
     export KAFKA_METRICS_PORT=$METRICS_PORT
     python3 -m services.kafka.kafka_consumer &

@@ -1,10 +1,9 @@
 """
 FastAPI 서버 - 추천 상품 제공 API
 """
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from typing import List, Optional
-from sqlalchemy.orm import Session
 import yaml
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
@@ -14,9 +13,9 @@ config_path = "/app/config.yml" if os.path.exists("/app/config.yml") else "confi
 with open(config_path, "r") as f:
     config = yaml.safe_load(f)
 
-# DB 및 추천 로직 import
-from services.database import get_db, UserRecommendation, ProductRecommendation, UserActionSummary
+# 추천 로직 import
 from services.recommender import Recommender
+from services.mongodb import get_user_recommendations, get_product_recommendations
 
 app = FastAPI(
     title="MUNOVA Recommend Server",
@@ -34,8 +33,8 @@ async def startup_event():
     global recommender
     
     try:
-        # Recommender 초기화 (DB 세션은 매 요청마다 생성)
-        recommender = Recommender(db_session=None)
+        # Recommender 초기화 (MongoDB 사용)
+        recommender = Recommender()
         print("✅ Recommender 초기화 완료")
     except Exception as e:
         print(f"⚠️ Recommender 초기화 실패: {e}")
@@ -61,41 +60,29 @@ def metrics():
 
 
 @app.get("/api/recommend/user/{member_id}")
-def get_user_recommendations(
+def get_user_recommendations_api(
     member_id: int,
-    limit: Optional[int] = 8,
-    db: Session = Depends(get_db)
+    limit: Optional[int] = 8
 ):
     """
-    사용자 기반 추천 상품 조회
+    사용자 기반 추천 상품 조회 (MongoDB에서 조회)
     
     Args:
         member_id: 사용자 ID
         limit: 추천 상품 개수 (기본값: 8)
-        db: 데이터베이스 세션
     
     Returns:
         추천 상품 목록
     """
     try:
-        if db is None:
-            return {
-                "member_id": member_id,
-                "count": 0,
-                "recommendations": [],
-                "message": "데이터베이스가 연결되지 않았습니다."
-            }
-        
-        recommendations = db.query(UserRecommendation).filter(
-            UserRecommendation.member_id == member_id
-        ).order_by(UserRecommendation.score.desc()).limit(limit).all()
+        recommendations = get_user_recommendations(member_id, limit)
         
         result = [
             {
-                "product_id": rec.product_id,
-                "score": rec.score,
-                "created_at": rec.created_at.isoformat() if rec.created_at else None,
-                "updated_at": rec.updated_at.isoformat() if rec.updated_at else None
+                "product_id": rec.get("product_id"),
+                "score": rec.get("score"),
+                "created_at": rec.get("created_at").isoformat() if rec.get("created_at") else None,
+                "updated_at": rec.get("updated_at").isoformat() if rec.get("updated_at") else None
             }
             for rec in recommendations
         ]
@@ -110,39 +97,27 @@ def get_user_recommendations(
 
 
 @app.get("/api/recommend/product/{product_id}")
-def get_product_recommendations(
+def get_product_recommendations_api(
     product_id: int,
-    limit: Optional[int] = 4,
-    db: Session = Depends(get_db)
+    limit: Optional[int] = 4
 ):
     """
-    상품 기반 유사 상품 추천 조회
+    상품 기반 유사 상품 추천 조회 (MongoDB에서 조회)
     
     Args:
         product_id: 상품 ID
         limit: 추천 상품 개수 (기본값: 4)
-        db: 데이터베이스 세션
     
     Returns:
         유사 상품 목록
     """
     try:
-        if db is None:
-            return {
-                "product_id": product_id,
-                "count": 0,
-                "recommendations": [],
-                "message": "데이터베이스가 연결되지 않았습니다."
-            }
-        
-        recommendations = db.query(ProductRecommendation).filter(
-            ProductRecommendation.source_product_id == product_id
-        ).limit(limit).all()
+        recommendations = get_product_recommendations(product_id, limit)
         
         result = [
             {
-                "target_product_id": rec.target_product_id,
-                "created_at": rec.created_at.isoformat() if rec.created_at else None
+                "target_product_id": rec.get("target_product_id"),
+                "created_at": rec.get("created_at").isoformat() if rec.get("created_at") else None
             }
             for rec in recommendations
         ]
@@ -159,16 +134,14 @@ def get_product_recommendations(
 @app.get("/api/recommend/user/{member_id}/product/{product_id}/score")
 def get_recommendation_score(
     member_id: int,
-    product_id: int,
-    db: Session = Depends(get_db)
+    product_id: int
 ):
     """
-    추천 점수 조회
+    추천 점수 조회 (MongoDB에서 사용자 행동 조회 후 계산)
     
     Args:
         member_id: 사용자 ID
         product_id: 상품 ID
-        db: 데이터베이스 세션
     
     Returns:
         추천 점수 (0~100)
@@ -179,10 +152,7 @@ def get_recommendation_score(
         raise HTTPException(status_code=500, detail="Recommender가 초기화되지 않았습니다.")
     
     try:
-        # DB 세션을 Recommender에 설정
-        recommender.db_session = db
-        
-        # 점수 계산
+        # 점수 계산 (MongoDB에서 자동으로 조회)
         score = recommender.get_recommendation_score(member_id, product_id)
         
         return {

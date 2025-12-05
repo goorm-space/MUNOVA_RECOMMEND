@@ -83,3 +83,4 @@
 - 현재 CPU 80%: batch_size 증가 + 매 메시지 print 출력
 - 최적화 후: print 제거로 CPU 40-50% 예상
 
+

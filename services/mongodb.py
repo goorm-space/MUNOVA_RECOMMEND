@@ -93,6 +93,9 @@ def get_mongodb_db():
 COLLECTION_RECOMMENDATION_LOGS = "recommendation_logs"  # 추천 결과 로그
 COLLECTION_USER_ACTION_LOGS = "user_action_logs"  # 사용자 행동 로그
 COLLECTION_RECOMMENDATION_HISTORY = "recommendation_history"  # 추천 히스토리
+COLLECTION_USER_ACTION_SUMMARIES = "user_action_summaries"  # 사용자 행동 요약 (MySQL 대체)
+COLLECTION_USER_RECOMMENDATIONS = "user_recommendations"  # 사용자 추천 결과 (MySQL 대체)
+COLLECTION_PRODUCT_RECOMMENDATIONS = "product_recommendations"  # 상품 추천 결과 (MySQL 대체)
 
 
 def save_recommendation_log(
@@ -203,7 +206,9 @@ def save_user_action_logs_batch(documents: List[Dict[str, Any]]) -> bool:
     
     try:
         collection = db[COLLECTION_USER_ACTION_LOGS]
-        collection.insert_many(documents, ordered=False)  # ordered=False: 일부 실패해도 계속 진행
+        # 고성능: ordered=False, write concern 최적화 (w=0: ack 없음, j=False: journaling 없음)
+        from pymongo import WriteConcern
+        collection.with_options(write_concern=WriteConcern(w=0, j=False)).insert_many(documents, ordered=False)
         return True
     except Exception as e:
         print(f"⚠️ 사용자 행동 로그 배치 저장 실패: {e}")
@@ -229,7 +234,9 @@ def save_recommendation_logs_batch(documents: List[Dict[str, Any]]) -> bool:
     
     try:
         collection = db[COLLECTION_RECOMMENDATION_LOGS]
-        collection.insert_many(documents, ordered=False)  # ordered=False: 일부 실패해도 계속 진행
+        # 고성능: ordered=False, write concern 최적화 (w=0: ack 없음, j=False: journaling 없음)
+        from pymongo import WriteConcern
+        collection.with_options(write_concern=WriteConcern(w=0, j=False)).insert_many(documents, ordered=False)
         return True
     except Exception as e:
         print(f"⚠️ 추천 로그 배치 저장 실패: {e}")
@@ -298,9 +305,291 @@ def create_indexes():
         recommendation_history.create_index([("member_id", 1), ("created_at", -1)])
         recommendation_history.create_index([("recommendation_type", 1)])
         
+        # 사용자 행동 요약 인덱스 (MySQL 대체)
+        user_action_summaries = db[COLLECTION_USER_ACTION_SUMMARIES]
+        user_action_summaries.create_index([("member_id", 1), ("product_id", 1)], unique=True)
+        user_action_summaries.create_index([("member_id", 1)])
+        user_action_summaries.create_index([("product_id", 1)])
+        user_action_summaries.create_index([("category_id", 1)])
+        user_action_summaries.create_index([("brand_id", 1)])
+        
+        # 사용자 추천 결과 인덱스 (MySQL 대체)
+        user_recommendations = db[COLLECTION_USER_RECOMMENDATIONS]
+        user_recommendations.create_index([("member_id", 1), ("product_id", 1)], unique=True)
+        user_recommendations.create_index([("member_id", 1), ("score", -1)])
+        user_recommendations.create_index([("product_id", 1)])
+        
+        # 상품 추천 결과 인덱스 (MySQL 대체)
+        product_recommendations = db[COLLECTION_PRODUCT_RECOMMENDATIONS]
+        product_recommendations.create_index([("source_product_id", 1), ("target_product_id", 1)], unique=True)
+        product_recommendations.create_index([("source_product_id", 1)])
+        
         print("✅ MongoDB 인덱스 생성 완료")
     except Exception as e:
         print(f"⚠️ MongoDB 인덱스 생성 실패: {e}")
+
+
+# ============================================
+# MySQL 대체 함수들 (MongoDB로 전환)
+# ============================================
+
+def save_user_action_summary(
+    member_id: int,
+    product_id: int,
+    clicked: int = 0,
+    liked: Optional[bool] = None,
+    in_cart: Optional[bool] = None,
+    purchased: Optional[bool] = None,
+    clicked_at: Optional[datetime] = None,
+    liked_at: Optional[datetime] = None,
+    in_cart_at: Optional[datetime] = None,
+    purchased_at: Optional[datetime] = None,
+    category_id: Optional[int] = None,
+    brand_id: Optional[int] = None,
+    price: Optional[int] = None,
+    session_id: Optional[str] = None
+) -> bool:
+    """
+    사용자 행동 요약을 MongoDB에 저장/업데이트 (MySQL UserActionSummary 대체)
+    
+    Returns:
+        저장 성공 여부
+    """
+    db = get_mongodb_db()
+    if db is None:
+        return False
+    
+    try:
+        collection = db[COLLECTION_USER_ACTION_SUMMARIES]
+        
+        # 기존 문서 조회
+        existing = collection.find_one({
+            "member_id": member_id,
+            "product_id": product_id
+        })
+        
+        update_doc = {
+            "member_id": member_id,
+            "product_id": product_id,
+            "last_updated": datetime.utcnow()
+        }
+        
+        # 기존 값 유지하면서 업데이트
+        if existing:
+            # clicked는 누적 (증가)
+            if clicked > 0:
+                update_doc["clicked"] = existing.get("clicked", 0) + clicked
+                update_doc["clicked_at"] = clicked_at or datetime.utcnow()
+            else:
+                update_doc["clicked"] = existing.get("clicked", 0)
+                update_doc["clicked_at"] = existing.get("clicked_at")
+            
+            # liked, in_cart, purchased는 덮어쓰기
+            update_doc["liked"] = liked if liked is not None else existing.get("liked")
+            update_doc["in_cart"] = in_cart if in_cart is not None else existing.get("in_cart")
+            update_doc["purchased"] = purchased if purchased is not None else existing.get("purchased")
+            update_doc["liked_at"] = liked_at if liked_at else existing.get("liked_at")
+            update_doc["in_cart_at"] = in_cart_at if in_cart_at else existing.get("in_cart_at")
+            update_doc["purchased_at"] = purchased_at if purchased_at else existing.get("purchased_at")
+        else:
+            update_doc["clicked"] = clicked
+            update_doc["liked"] = liked
+            update_doc["in_cart"] = in_cart
+            update_doc["purchased"] = purchased
+            update_doc["clicked_at"] = clicked_at
+            update_doc["liked_at"] = liked_at
+            update_doc["in_cart_at"] = in_cart_at
+            update_doc["purchased_at"] = purchased_at
+            update_doc["created_at"] = datetime.utcnow()
+        
+        # 메타데이터 업데이트
+        if category_id is not None:
+            update_doc["category_id"] = category_id
+        elif existing and "category_id" in existing:
+            update_doc["category_id"] = existing["category_id"]
+            
+        if brand_id is not None:
+            update_doc["brand_id"] = brand_id
+        elif existing and "brand_id" in existing:
+            update_doc["brand_id"] = existing["brand_id"]
+            
+        if price is not None:
+            update_doc["price"] = price
+        elif existing and "price" in existing:
+            update_doc["price"] = existing["price"]
+            
+        if session_id is not None:
+            update_doc["last_session_id"] = session_id
+        elif existing and "last_session_id" in existing:
+            update_doc["last_session_id"] = existing["last_session_id"]
+        
+        # Upsert (없으면 생성, 있으면 업데이트)
+        collection.update_one(
+            {"member_id": member_id, "product_id": product_id},
+            {"$set": update_doc},
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        print(f"⚠️ 사용자 행동 요약 저장 실패: {e}")
+        return False
+
+
+def get_user_action_summary(member_id: int, product_id: int) -> Optional[Dict[str, Any]]:
+    """
+    사용자 행동 요약 조회 (MySQL UserActionSummary 대체)
+    
+    Returns:
+        사용자 행동 요약 딕셔너리 또는 None
+    """
+    db = get_mongodb_db()
+    if db is None:
+        return None
+    
+    try:
+        collection = db[COLLECTION_USER_ACTION_SUMMARIES]
+        doc = collection.find_one({
+            "member_id": member_id,
+            "product_id": product_id
+        })
+        return doc
+    except Exception as e:
+        print(f"⚠️ 사용자 행동 요약 조회 실패: {e}")
+        return None
+
+
+def save_user_recommendation(member_id: int, product_id: int, score: float) -> bool:
+    """
+    사용자 추천 결과 저장 (상위 8개만 유지) - MySQL UserRecommendation 대체
+    
+    Returns:
+        저장 성공 여부
+    """
+    db = get_mongodb_db()
+    if db is None:
+        return False
+    
+    try:
+        collection = db[COLLECTION_USER_RECOMMENDATIONS]
+        
+        # 기존 추천이 있으면 업데이트, 없으면 생성
+        collection.update_one(
+            {"member_id": member_id, "product_id": product_id},
+            {
+                "$set": {
+                    "member_id": member_id,
+                    "product_id": product_id,
+                    "score": score,
+                    "updated_at": datetime.utcnow()
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
+        
+        # 상위 8개만 유지 (나머지 삭제)
+        all_recommendations = list(collection.find(
+            {"member_id": member_id}
+        ).sort("score", -1))
+        
+        if len(all_recommendations) > 8:
+            # 8개 이후의 문서 삭제
+            ids_to_delete = [doc["_id"] for doc in all_recommendations[8:]]
+            collection.delete_many({"_id": {"$in": ids_to_delete}})
+        
+        return True
+    except Exception as e:
+        print(f"⚠️ 사용자 추천 결과 저장 실패: {e}")
+        return False
+
+
+def get_user_recommendations(member_id: int, limit: int = 8) -> List[Dict[str, Any]]:
+    """
+    사용자 추천 결과 조회 (MySQL UserRecommendation 대체)
+    
+    Returns:
+        추천 결과 리스트
+    """
+    db = get_mongodb_db()
+    if db is None:
+        return []
+    
+    try:
+        collection = db[COLLECTION_USER_RECOMMENDATIONS]
+        recommendations = list(collection.find(
+            {"member_id": member_id}
+        ).sort("score", -1).limit(limit))
+        
+        # ObjectId를 문자열로 변환
+        for rec in recommendations:
+            rec["id"] = str(rec.pop("_id"))
+        
+        return recommendations
+    except Exception as e:
+        print(f"⚠️ 사용자 추천 결과 조회 실패: {e}")
+        return []
+
+
+def save_product_recommendation(source_product_id: int, target_product_id: int) -> bool:
+    """
+    상품 추천 결과 저장 (MySQL ProductRecommendation 대체)
+    
+    Returns:
+        저장 성공 여부
+    """
+    db = get_mongodb_db()
+    if db is None:
+        return False
+    
+    try:
+        collection = db[COLLECTION_PRODUCT_RECOMMENDATIONS]
+        collection.update_one(
+            {"source_product_id": source_product_id, "target_product_id": target_product_id},
+            {
+                "$set": {
+                    "source_product_id": source_product_id,
+                    "target_product_id": target_product_id,
+                    "updated_at": datetime.utcnow()
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        print(f"⚠️ 상품 추천 결과 저장 실패: {e}")
+        return False
+
+
+def get_product_recommendations(product_id: int, limit: int = 4) -> List[Dict[str, Any]]:
+    """
+    상품 추천 결과 조회 (MySQL ProductRecommendation 대체)
+    
+    Returns:
+        추천 결과 리스트
+    """
+    db = get_mongodb_db()
+    if db is None:
+        return []
+    
+    try:
+        collection = db[COLLECTION_PRODUCT_RECOMMENDATIONS]
+        recommendations = list(collection.find(
+            {"source_product_id": product_id}
+        ).limit(limit))
+        
+        # ObjectId를 문자열로 변환
+        for rec in recommendations:
+            rec["id"] = str(rec.pop("_id"))
+        
+        return recommendations
+    except Exception as e:
+        print(f"⚠️ 상품 추천 결과 조회 실패: {e}")
+        return []
 
 
 # 초기화 시 인덱스 생성
