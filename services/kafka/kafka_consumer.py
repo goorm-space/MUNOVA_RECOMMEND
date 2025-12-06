@@ -128,6 +128,10 @@ class MunovaKafkaConsumer:
         
         # 파티션 할당 추적
         self.assigned_partitions = set()  # (topic, partition) 튜플 세트로 저장
+
+        # consumer dlq
+        self.retry_cache={}
+        self.max_retry=3
         
         # 모니터링
         self.processed_count = 0
@@ -148,6 +152,28 @@ class MunovaKafkaConsumer:
     # Context manager 종료
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+    def mongo_batch_insert_with_retry(self, func, docs, retries=3):
+        """MongoDB 배치 저장을 지정된 횟수만큼 재시도"""
+        for attempt in range(1, retries + 1):
+            try:
+                ok = func(docs)
+                if ok:
+                    return True
+                logger.warning(f"⚠️ MongoDB 저장 실패 (attempt {attempt}/{retries})")
+            except Exception as e:
+                logger.error(f"❌ MongoDB 예외 (attempt {attempt}/{retries}): {e}", exc_info=True)
+            time.sleep(0.5)  # 간단한 backoff
+        return False
+
+    def write_to_local_dlq(self, docs, reason="mongodb_failed"):
+        """최종적으로 MongoDB insert 실패한 메시지를 로컬 DLQ 파일에 저장"""
+        filename = f"dlq_{datetime.utcnow().strftime('%Y%m%d')}.jsonl"
+        with open(filename, "a") as f:
+            for d in docs:
+                d["_dlq_reason"] = reason
+                f.write(json.dumps(d) + "\n")
+        logger.error(f"🚨 DLQ 파일 저장 완료: {len(docs)}개 → {filename}")
 
     # Kafka Consumer를 시작하고, 토픽 구독, 파티션 콜백 설정, Prometheus 메트릭 서버까지 초기화하는 초기화 및 실행 메서드
     def start(self):
@@ -464,6 +490,11 @@ class MunovaKafkaConsumer:
                 
                 processed_messages.append(msg)
                 self.processed_count += 1
+
+                # DLQ 로직으로 정상 처리된 메시지의 retry_cache 정리
+                key=(msg.partition(),msg.offset())
+                if key in self.retry_cache:
+                    del self.retry_cache[key]
                 
                 # 주기적으로 로그 출력 (성능 최적화: 빈도 감소)
                 if self.processed_count % 1000 == 0:
@@ -473,7 +504,12 @@ class MunovaKafkaConsumer:
             except Exception as e:
                 logger.error(f"❌ 메시지 처리 중 오류: {e}", exc_info=True)
                 error_counter.labels(error_type="processing_error").inc() if error_counter else None
-                
+
+                key=(msg.partition(), msg.offset())
+                current_retry=self.retry_cache.get(key,0)+1
+                self.retry_cache[key]=current_retry
+                logger.warning(f"⚠️ 메시지 처리 실패 (retry {current_retry}/{self.max_retry}) offset={msg.offset()}")
+
                 # 실패 메트릭 기록
                 try:
                     event_type = 'unknown'
@@ -494,89 +530,107 @@ class MunovaKafkaConsumer:
                         ).inc()
                 except:
                     pass
-                
-                failed_messages.append(msg)
-                self.error_count += 1
-                
-                # DLQ로 전송 (선택사항)
-                # TODO: DLQ 구현
+
+                if current_retry<=self.max_retry:
+                    # 재시도 대상 -> 실패 리스트에 넣고 commit X
+                    failed_messages.append(msg)
+                    continue
+                else:
+                    # 3회 이상 실패 시 -> DLQ 로 보내고 다시 읽지 않음
+                    logger.error(f"🚨 메시지 영구 실패 → DLQ 이동 offset={msg.offset()}")
+                    dlq_doc={
+                        "raw_kafka_value": msg.value().decode('utf-8', errors='ignore') if msg.value() else None,
+                        "topic": msg.topic(),
+                        "partition": msg.partition(),
+                        "offset": msg.offset(),
+                        "error": str(e),
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                    self.write_to_local_dlq([dlq_doc],reason="processing_error")
+                    processed_messages.append(msg)
+                    # retry cache에서 제거 (메모리 누수 방지)
+                    del self.retry_cache[key]
+                    continue
+
         
         # 배치 단위로 MongoDB에 저장 (성능 최적화: insert_many 사용)
         # 비동기 처리로 저장 실패 여부와 관계 없이 메시지를 '처리된 것'으로 봄
         if user_action_logs:
-            try:
-                save_success = save_user_action_logs_batch(user_action_logs)
-                # 성능 최적화: 성공 로그 제거 (오류만 로깅)
-                if not save_success:
-                    logger.warning(f"⚠️ MongoDB 사용자 행동 로그 배치 저장 실패: {len(user_action_logs)}개")
-                    mongodb_failed = True
-            except Exception as e:
-                logger.error(f"❌ MongoDB 사용자 행동 로그 배치 저장 중 오류: {e}", exc_info=True)
+            ok = self.mongo_batch_insert_with_retry(
+                save_user_action_logs_batch,
+                user_action_logs,
+                retries=3
+            )
+            if not ok:
+                logger.error("❌ 사용자 행동 로그 MongoDB 저장 실패 → DLQ로 백업")
+                self.write_to_local_dlq(user_action_logs,reason="user_action_mongo_failed")
                 mongodb_failed = True
+
         if recommendation_logs:
-            try:
-                save_success = save_recommendation_logs_batch(recommendation_logs)
-                # 성능 최적화: 성공 로그 제거 (오류만 로깅)
-                if not save_success:
-                    logger.warning(f"⚠️ MongoDB 추천 로그 배치 저장 실패: {len(recommendation_logs)}개")
-                    mongodb_failed = True
-            except Exception as e:
-                logger.error(f"❌ MongoDB 추천 로그 배치 저장 중 오류: {e}", exc_info=True)
-                mongodb_failed = True
+            ok = self.mongo_batch_insert_with_retry(
+                save_recommendation_logs_batch,
+                recommendation_logs,
+                retries=3
+            )
+            if not ok:
+                logger.error("❌ 추천 로그 MongoDB 저장 실패 → DLQ로 백업")
+                self.write_to_local_dlq(recommendation_logs,reason="recommendation_mongo_failed")
+                mongodb_failed=True
         
         # 성공적으로 처리된 메시지만 커밋 (MongoDB 저장 성공 여부와 무관하게 처리 완료된 메시지만 커밋)
         if mongodb_failed:
             logger.error("❌ MongoDB 배치 저장 실패로 인해 오프셋 커밋을 수행하지 않습니다. 배치를 실패로 처리합니다.")
-        else:
-            if processed_messages:
-                try:
-                    # 파티션이 할당되어 있는지 확인 (rebalancing 중이면 커밋하지 않음)
-                    if len(self.assigned_partitions) == 0:
-                        logger.warning("⚠️ 파티션이 할당되지 않음. 오프셋 커밋 건너뜀")
-                        return True  # 메시지는 처리했으므로 True 반환
+            return False
 
-                    # 각 파티션별로 마지막 오프셋 추적
-                    from confluent_kafka import TopicPartition
-                    offsets_to_commit = {}
+        if processed_messages:
+            try:
+                # 파티션이 할당되어 있는지 확인 (rebalancing 중이면 커밋하지 않음)
+                if len(self.assigned_partitions) == 0:
+                    logger.warning("⚠️ 파티션이 할당되지 않음. 오프셋 커밋 건너뜀")
+                    return True  # 메시지는 처리했으므로 True 반환
 
-                    for msg in processed_messages:
-                        topic = msg.topic()
-                        partition = msg.partition()
-                        offset = msg.offset()
+                # 각 파티션별로 마지막 오프셋 추적
+                from confluent_kafka import TopicPartition
+                offsets_to_commit = {}
 
-                        # 할당된 파티션인지 확인
-                        if (topic, partition) not in self.assigned_partitions:
-                            logger.warning(f"⚠️ 파티션 {topic}:{partition}가 할당되지 않음. 커밋 건너뜀")
-                            continue
+                for msg in processed_messages:
+                    topic = msg.topic()
+                    partition = msg.partition()
+                    offset = msg.offset()
 
-                        key = (topic, partition)
-                        # 각 파티션의 최대 오프셋만 유지 (다음 오프셋 커밋)
-                        if key not in offsets_to_commit or offsets_to_commit[key] < offset + 1:
-                            offsets_to_commit[key] = offset + 1
+                    # 할당된 파티션인지 확인
+                    if (topic, partition) not in self.assigned_partitions:
+                        logger.warning(f"⚠️ 파티션 {topic}:{partition}가 할당되지 않음. 커밋 건너뜀")
+                        continue
 
-                    # 실제 커밋 호출
-                    tps_to_commit = [
-                        TopicPartition(topic, partition, offset)
-                        for (topic, partition), offset in offsets_to_commit.items()
-                    ]
+                    key = (topic, partition)
+                    # 각 파티션의 최대 오프셋만 유지 (다음 오프셋 커밋)
+                    if key not in offsets_to_commit or offsets_to_commit[key] < offset + 1:
+                        offsets_to_commit[key] = offset + 1
 
-                    if tps_to_commit:
-                        self.consumer.commit(offsets=tps_to_commit, asynchronous=False) # False: 동기 커밋 -> 안정성 우선
-                        logger.debug(f"✅ {len(processed_messages)}개 메시지 커밋 완료 ({len(tps_to_commit)}개 파티션)")
-                    else:
-                        logger.debug("⚠️ 커밋할 오프셋이 없음 (모든 파티션이 할당되지 않음)")
+                # 실제 커밋 호출
+                tps_to_commit = [
+                    TopicPartition(topic, partition, offset)
+                    for (topic, partition), offset in offsets_to_commit.items()
+                ]
 
-                # 커밋 실패 처리
-                except Exception as e:
-                    # UNKNOWN_TOPIC_OR_PART 에러는 rebalancing 중일 때 발생할 수 있으므로 경고만
-                    error_msg = str(e)
-                    if "UNKNOWN_TOPIC_OR_PART" in error_msg or "Unknown topic or partition" in error_msg:
-                        logger.warning(f"⚠️ 오프셋 커밋 실패 (rebalancing 중일 수 있음): {e}")
-                    else:
-                        logger.error(f"❌ 오프셋 커밋 실패: {e}", exc_info=True)
-                        error_counter.labels(error_type="commit_error").inc() if error_counter else None
-                    # 커밋 실패해도 메시지는 처리했으므로 True 반환 (다음 배치에서 재시도)
-                    return False
+                if tps_to_commit:
+                    self.consumer.commit(offsets=tps_to_commit, asynchronous=False) # False: 동기 커밋 -> 안정성 우선
+                    logger.debug(f"✅ {len(processed_messages)}개 메시지 커밋 완료 ({len(tps_to_commit)}개 파티션)")
+                else:
+                    logger.debug("⚠️ 커밋할 오프셋이 없음 (모든 파티션이 할당되지 않음)")
+
+            # 커밋 실패 처리
+            except Exception as e:
+                # UNKNOWN_TOPIC_OR_PART 에러는 rebalancing 중일 때 발생할 수 있으므로 경고만
+                error_msg = str(e)
+                if "UNKNOWN_TOPIC_OR_PART" in error_msg or "Unknown topic or partition" in error_msg:
+                    logger.warning(f"⚠️ 오프셋 커밋 실패 (rebalancing 중일 수 있음): {e}")
+                else:
+                    logger.error(f"❌ 오프셋 커밋 실패: {e}", exc_info=True)
+                    error_counter.labels(error_type="commit_error").inc() if error_counter else None
+                # 커밋 실패해도 메시지는 처리했으므로 True 반환 (다음 배치에서 재시도)
+                return False
         
         # 실패한 메시지는 커밋하지 않음 (재시도 가능)
         if failed_messages:
