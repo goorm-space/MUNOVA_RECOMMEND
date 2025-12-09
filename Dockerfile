@@ -15,6 +15,8 @@ RUN apt-get update && \
             -O /tmp/protoc.zip && \
         unzip -q /tmp/protoc.zip -d /usr/local && \
         chmod +x /usr/local/bin/protoc && \
+        ls -la /usr/local/bin/protoc && \
+        /usr/local/bin/protoc --version && \
         rm /tmp/protoc.zip && \
         apt-get remove -y wget unzip && \
         apt-get autoremove -y; \
@@ -24,7 +26,6 @@ RUN apt-get update && \
     else \
         echo "❌ Unsupported architecture: $ARCH" && exit 1; \
     fi && \
-    /usr/local/bin/protoc --version 2>/dev/null || protoc --version && \
     rm -rf /var/lib/apt/lists/*
 
 COPY ./requirements.txt /app/requirements.txt
