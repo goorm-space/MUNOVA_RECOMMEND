@@ -218,3 +218,11 @@ config.yml
 
 # Test files
 test*.py
+
+# Documentation files (keep README.md)
+*.md
+!README.md
+
+# Script files (keep services/ scripts)
+*.sh
+!services/**/*.sh
