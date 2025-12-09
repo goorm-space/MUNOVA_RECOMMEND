@@ -37,5 +37,6 @@ RUN protoc --python_out=. user_action_log.proto
 
 RUN chmod +x services/kafka/start_kafka_consumer.sh
 RUN chmod +x services/start_server.sh
+RUN chmod +x services/start_batch.sh
 
 CMD ["bash", "services/start_server.sh"]

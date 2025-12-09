@@ -28,6 +28,23 @@ services:
     depends_on:
       - mongodb
 
+  batch-recommender:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: recommend-batch
+    restart: always
+    networks:
+      - munova-net
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - .:/app
+    command: ["bash", "services/start_batch.sh"]
+    depends_on:
+      - mongodb
+      - recommend  # recommend 컨테이너가 먼저 시작되어 인덱스 생성 완료 대기
+
   mongodb:
     image: mongo:8.2
     container_name: recommend-mongodb

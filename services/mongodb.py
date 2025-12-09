@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
 import yaml
@@ -254,13 +254,63 @@ def save_recommendation_history(
         return False
 
 
-# Index 생성
+# Index 생성 (Race Condition 방지를 위한 Lock 메커니즘 포함)
 def create_indexes():
     db = get_mongodb_db()
     if db is None:
         logger.warning("[create_indexes] MongoDB 사용 불가 — 인덱스 생성 스킵")
         return
 
+    # Lock 컬렉션을 사용한 동시 실행 방지
+    lock_collection = db["_index_creation_lock"]
+    lock_key = "index_creation_in_progress"
+    
+    # Lock 획득 시도 (최대 30초 대기)
+    import time
+    max_wait = 30
+    wait_interval = 1
+    waited = 0
+    
+    while waited < max_wait:
+        try:
+            # Lock 문서가 없거나 만료된 경우에만 생성 시도
+            lock_doc = lock_collection.find_one({"_id": lock_key})
+            if lock_doc is None:
+                # Lock 생성 시도 (5분 TTL)
+                lock_collection.insert_one({
+                    "_id": lock_key,
+                    "created_at": datetime.utcnow(),
+                    "expires_at": datetime.utcnow().replace(second=0, microsecond=0) + timedelta(minutes=5)
+                })
+                logger.info("[create_indexes] Lock 획득 성공 - 인덱스 생성 시작")
+                break
+            else:
+                # Lock이 만료되었는지 확인
+                expires_at = lock_doc.get("expires_at")
+                if expires_at and datetime.utcnow() > expires_at:
+                    # 만료된 Lock 삭제 후 재시도
+                    lock_collection.delete_one({"_id": lock_key})
+                    continue
+                else:
+                    # 다른 프로세스가 인덱스 생성 중
+                    logger.info(f"[create_indexes] 다른 프로세스가 인덱스 생성 중. 대기 중... ({waited}/{max_wait}초)")
+                    time.sleep(wait_interval)
+                    waited += wait_interval
+        except Exception as e:
+            # 중복 키 에러는 다른 프로세스가 이미 Lock을 획득한 것
+            if "duplicate key" in str(e).lower() or "E11000" in str(e):
+                logger.info(f"[create_indexes] Lock 획득 실패 (다른 프로세스 실행 중). 대기 중... ({waited}/{max_wait}초)")
+                time.sleep(wait_interval)
+                waited += wait_interval
+            else:
+                logger.warning(f"[create_indexes] Lock 획득 중 오류: {e}")
+                time.sleep(wait_interval)
+                waited += wait_interval
+    
+    if waited >= max_wait:
+        logger.warning("[create_indexes] Lock 획득 시간 초과. 다른 프로세스가 인덱스 생성 중일 수 있습니다. 인덱스 생성 스킵.")
+        return
+    
     try:
         # 추천 로그 인덱스
         recommendation_logs = db[COLLECTION_RECOMMENDATION_LOGS]
@@ -272,8 +322,10 @@ def create_indexes():
         user_action_logs = db[COLLECTION_USER_ACTION_LOGS]
         user_action_logs.create_index([("member_id", 1), ("product_id", 1)])
         user_action_logs.create_index([("created_at", -1)])
-        user_action_logs.create_index([("event_type", 1)])
-
+        user_action_logs.create_index(
+            [("created_at", 1)],
+            expireAfterSeconds=60 * 60 * 24 * 90  # 90일 뒤 자동 삭제
+        )
         # 추천 히스토리 인덱스
         recommendation_history = db[COLLECTION_RECOMMENDATION_HISTORY]
         recommendation_history.create_index([("member_id", 1), ("created_at", -1)])
@@ -302,6 +354,13 @@ def create_indexes():
     except Exception as e:
         logger.error("⚠️ [create_indexes] MongoDB 인덱스 생성 실패", exc_info=True)
         return
+    finally:
+        # Lock 해제
+        try:
+            lock_collection.delete_one({"_id": lock_key})
+            logger.debug("[create_indexes] Lock 해제 완료")
+        except Exception as e:
+            logger.warning(f"[create_indexes] Lock 해제 중 오류 (무시 가능): {e}")
 
 
 # 집계 결과 스냅샷 -> UserActionSummary
@@ -320,6 +379,13 @@ def save_user_action_summary(
         brand_id: Optional[int] = None,
         price: Optional[int] = None,
 ) -> bool:
+    """
+    UserActionSummary 스냅샷 upsert.
+
+    - clicked: 이번 이벤트에서 증가한 클릭 수(difference / delta)만 전달받는다고 가정.
+      여기서 MongoDB의 기존 clicked 값에 누적해서 저장한다.
+    - liked / in_cart / purchased: 현재 상태로 덮어쓰는 플래그.
+    """
     db = get_mongodb_db()
     if db is None:
         logger.warning("[save_user_action_summary] MongoDB 사용 불가 — 저장 스킵")

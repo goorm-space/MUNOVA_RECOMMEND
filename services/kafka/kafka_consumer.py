@@ -9,8 +9,7 @@ from typing import Dict, Any, List, Optional
 import yaml
 from confluent_kafka import Consumer, KafkaError, KafkaException
 
-from services.mongodb import save_user_action_logs_batch, save_recommendation_logs_batch
-from services.recommender import Recommender
+from services.mongodb import save_user_action_logs_batch
 
 # 로깅 설정 (Protobuf import 전에 설정)
 logging.basicConfig(
@@ -121,9 +120,6 @@ class MunovaKafkaConsumer:
 
         # Kafka Consumer 객체를 저장하는 변수
         self.consumer: Optional[Consumer] = None
-
-        # Recommender Class 인스턴스를 생성하여 추천 로직 처리 담당 (Kafka에서 읽은 메시지로 추천 점수 계산, MongoDB에 저장)
-        self.recommender = Recommender()
 
         # 실행 상태 플래그
         self.running = False  # Consumer가 현재 실행중인지 상태표시 (run() 안에서 True/False 변경)
@@ -378,8 +374,6 @@ class MunovaKafkaConsumer:
         mongodb_failed = False
         # MongoDB 배치 저장을 위한 문서 리스트
         user_action_logs = []
-        recommendation_logs = []
-
         for msg in messages:
             try:
                 # 메시지 파싱 (Kafka 원본 형식 그대로)
@@ -437,8 +431,12 @@ class MunovaKafkaConsumer:
                 # logger.debug(f"🔄 메시지 처리 시작: eventType={event_type}, memberId={kafka_data.get('memberId')}, productId={kafka_data.get('data', {}).get('product_id')}, partition={msg.partition()}, offset={msg.offset()}")
 
                 # 추천 로직: 실제 점수 계산 + 사용자/상품 요약 업데이트
-                result = self.recommender.process_kafka_message(kafka_data)
-
+                result = {
+                    "member_id": kafka_data.get("memberId"),
+                    "product_id": kafka_data.get("data", {}).get("product_id"),
+                    "event_type": kafka_data.get("eventType"),
+                    "kafka_metadata": kafka_data.get("_kafka_metadata")
+                }
                 if result is None:
                     processed_messages.append(msg)
                     continue
@@ -447,10 +445,6 @@ class MunovaKafkaConsumer:
                 member_id = result.get('member_id')
                 product_id = result.get('product_id')
                 event_type = result.get('event_type')
-                score = result.get('score', 0)
-                category_id = result.get('category_id')
-                brand_id = result.get('brand_id')
-                price = result.get('price')
                 kafka_metadata = result.get('kafka_metadata', {})
 
                 # 사용자 행동 로그 문서
@@ -464,25 +458,6 @@ class MunovaKafkaConsumer:
                     "created_at": datetime.utcnow()
                 }
                 user_action_logs.append(user_action_doc)
-
-                # 추천 점수가 있으면 추천 로그도 준비
-                if score > 0:
-                    recommendation_doc = {
-                        "member_id": member_id,
-                        "product_id": product_id,
-                        "score": score,
-                        "event_type": event_type,
-                        "metadata": {
-                            'kafka_topic': kafka_metadata.get('topic'),
-                            'kafka_partition': kafka_metadata.get('partition'),
-                            'kafka_offset': kafka_metadata.get('offset'),
-                            'category_id': category_id,
-                            'brand_id': brand_id,
-                            'price': price
-                        },
-                        "created_at": datetime.utcnow()
-                    }
-                    recommendation_logs.append(recommendation_doc)
 
                 logger.debug(f"✅ 메시지 처리 완료: eventType={event_type}")
 
@@ -570,17 +545,6 @@ class MunovaKafkaConsumer:
             if not ok:
                 logger.error("❌ 사용자 행동 로그 MongoDB 저장 실패 → DLQ로 백업")
                 self.write_to_local_dlq(user_action_logs, reason="user_action_mongo_failed")
-                mongodb_failed = True
-
-        if recommendation_logs:
-            ok = self.mongo_batch_insert_with_retry(
-                save_recommendation_logs_batch,
-                recommendation_logs,
-                retries=3
-            )
-            if not ok:
-                logger.error("❌ 추천 로그 MongoDB 저장 실패 → DLQ로 백업")
-                self.write_to_local_dlq(recommendation_logs, reason="recommendation_mongo_failed")
                 mongodb_failed = True
 
         # 성공적으로 처리된 메시지만 커밋 (MongoDB 저장 성공 여부와 무관하게 처리 완료된 메시지만 커밋)

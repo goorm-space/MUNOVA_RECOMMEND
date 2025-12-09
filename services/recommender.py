@@ -58,7 +58,7 @@ class UserActionSummary:
 
 class Recommender:
     def __init__(self, db_session=None):
-        pass
+        self.db_session = db_session
         # 처리 대상 이벤트(추천 반영)
         self.supported_events = {
             "product_detail",
