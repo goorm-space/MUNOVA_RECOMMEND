@@ -1,0 +1,32 @@
+# ================================
+# MUNOVA Recommend Server Config (Production)
+# ================================
+# 이 파일을 config.yml로 복사하고 실제 값으로 수정하세요
+# cp config.prod.yml.example config.yml
+
+app:
+  name: recommend-server
+  env: production
+  log_level: INFO
+  consumer_group: recommend-consumer-group
+  stream_prefix: user_action_stream_
+
+mongodb:
+  host: localhost  # EC2에서 MongoDB 호스트 (외부 MongoDB 사용 시 IP 주소로 변경)
+  port: 27017
+  database: recommend
+  username: admin  # 실제 MongoDB 사용자명으로 변경
+  password: your_password_here  # 실제 MongoDB 비밀번호로 변경
+  enabled: true
+  auth_source: admin  # 인증 데이터베이스
+  max_pool_size: 50  # 초당 1만 처리: 10개 Consumer 최적화 (Consumer당 5개 연결)
+  min_pool_size: 10   # 초당 1만 처리: 최소 연결 수 증가
+
+kafka:
+  bootstrap_servers: localhost:9092  # EC2에서 Kafka 브로커 주소 (외부 Kafka 사용 시 IP:포트로 변경)
+  # 예: kafka1:9092,kafka2:9092,kafka3:9092 또는 10.0.1.100:9092,10.0.1.101:9092,10.0.1.102:9092
+  consumer_group_id: munova-recommendation-consumer
+  topic: user_action_log
+  batch_size: 5000  # 배치 처리 크기
+  metrics_port: 9000  # Prometheus 메트릭 서버 포트
+  consumer_count: 10  # 실행할 Consumer 개수

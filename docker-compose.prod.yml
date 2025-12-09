@@ -1,0 +1,33 @@
+services:
+  recommend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: recommend
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1
+      - KAFKA_CONSUMER_COUNT=10  # Consumer 개수
+    # network_mode: host 사용 시 ports 매핑은 무시됨 (호스트 네트워크 직접 사용)
+    # 포트: 8001 (FastAPI), 9000-9009 (Prometheus metrics)
+    network_mode: host  # EC2에서 외부 MongoDB/Kafka 연결을 위해 host 네트워크 사용
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  batch-recommender:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: recommend-batch
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["bash", "services/start_batch.sh"]
+    network_mode: host  # EC2에서 외부 MongoDB/Kafka 연결을 위해 host 네트워크 사용
+    depends_on:
+      recommend:
+        condition: service_healthy  # recommend 컨테이너가 헬스체크 통과 후 시작

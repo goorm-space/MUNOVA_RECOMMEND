@@ -1,0 +1,54 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.cursor/
+
+# Test files
+test*.py
+check_position.py
+
+# Data files
+*.jsonl
+dlq_*.jsonl
+
+# Documentation
+*.md
+!README.md
+
+# Monitoring config (optional)
+grafana-consumer-dashboard.json
+prometheus-kafka-config.yml
+
+# Config (will be mounted or copied separately)
+config.yml
+.env
+.envrc
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

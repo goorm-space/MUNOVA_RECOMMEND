@@ -226,3 +226,10 @@ test*.py
 # Script files (keep services/ scripts)
 *.sh
 !services/**/*.sh
+
+# 배포 불필요 파일
+check_position.py
+dlq_*.jsonl
+grafana-consumer-dashboard.json
+prometheus-kafka-config.yml
+*.iml

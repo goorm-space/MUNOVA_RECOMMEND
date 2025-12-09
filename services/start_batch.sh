@@ -5,6 +5,15 @@ echo "🚀 배치 추천 시스템 시작 중..."
 cd /app
 export PYTHONPATH=/app:$PYTHONPATH
 
+# config.yml 파일 확인
+if [ ! -f "/app/config.yml" ] && [ ! -f "config.yml" ]; then
+    echo "❌ 오류: config.yml 파일을 찾을 수 없습니다!"
+    echo "   config.prod.yml.example을 복사하여 config.yml을 생성하세요:"
+    echo "   cp config.prod.yml.example config.yml"
+    echo "   그리고 MongoDB, Kafka 정보를 수정하세요."
+    exit 1
+fi
+
 # MongoDB 연결 대기 (최대 60초)
 echo "⏳ MongoDB 연결 대기 중..."
 MAX_WAIT=60
@@ -36,6 +45,7 @@ fi
 # 배치 추천 실행
 echo "📊 배치 추천 프로세스 시작..."
 python3 -m services.batch_recommender_runner
+
 
 
 
