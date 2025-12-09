@@ -11,6 +11,8 @@ services:
     # network_mode: host 사용 시 ports 매핑은 무시됨 (호스트 네트워크 직접 사용)
     # 포트: 8001 (FastAPI), 9000-9009 (Prometheus metrics)
     network_mode: host  # EC2에서 외부 MongoDB/Kafka 연결을 위해 host 네트워크 사용
+    volumes:
+      - ./config.yml:/app/config.yml:ro  # config.yml 파일 마운트 (읽기 전용)
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health').read()"]
       interval: 30s
@@ -28,6 +30,8 @@ services:
       - PYTHONUNBUFFERED=1
     command: ["bash", "services/start_batch.sh"]
     network_mode: host  # EC2에서 외부 MongoDB/Kafka 연결을 위해 host 네트워크 사용
+    volumes:
+      - ./config.yml:/app/config.yml:ro  # config.yml 파일 마운트 (읽기 전용)
     depends_on:
       recommend:
         condition: service_healthy  # recommend 컨테이너가 헬스체크 통과 후 시작
